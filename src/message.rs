@@ -65,12 +65,12 @@ pub enum XMLFormatFlags {
 }
 
 const NFQ_XML_HW: u32 = 1;
-const NFQ_XML_MARK: u32 = (1 << 1);
-const NFQ_XML_DEV: u32 = (1 << 2);
-const NFQ_XML_PHYSDEV: u32 = (1 << 3);
-const NFQ_XML_PAYLOAD: u32 = (1 << 4);
-const NFQ_XML_TIME: u32 = (1 << 5);
-const NFQ_XML_ALL: u32 = (!0u32);
+const NFQ_XML_MARK: u32 = 1 << 1;
+const NFQ_XML_DEV: u32 = 1 << 2;
+const NFQ_XML_PHYSDEV: u32 = 1 << 3;
+const NFQ_XML_PAYLOAD: u32 = 1 << 4;
+const NFQ_XML_TIME: u32 = 1 << 5;
+const NFQ_XML_ALL: u32 = !0u32;
 
 /// Hardware address
 #[repr(C)]
@@ -118,7 +118,10 @@ extern "C" {
     fn nfq_get_physoutdev(nfad: NfqueueData) -> u32;
 
     fn nfq_get_packet_hw(nfad: NfqueueData) -> *const NfMsgPacketHw;
-    fn nfq_get_payload(nfad: NfqueueData, data: &*mut libc::c_void) -> libc::c_int;
+
+    /// WIREVEIL: fixed a *critical* flaw where the payload is always null, due to
+    ///           a difference with the C library
+    fn nfq_get_payload(nfad: NfqueueData, data: &mut *mut libc::c_void) -> libc::c_int;
 
     // printing functions
     fn nfq_snprintf_xml(
@@ -228,7 +231,12 @@ impl Message {
         let c_len = u16::from_be(unsafe { (*c_hw).hw_addrlen }) as usize;
         match c_len {
             0 => Err(NfqueueError::NoSuchAttribute),
-            _ => Ok(HwAddr::new(unsafe { &((*c_hw).hw_addr)[0..c_len] })),
+            _ => {
+                // SAFETY: c_hw is checked for null, and c_len is trusted from the C struct
+                let hw_addr_ptr = unsafe { (*c_hw).hw_addr.as_ptr() };
+                let hw_addr_slice = unsafe { std::slice::from_raw_parts(hw_addr_ptr, c_len) };
+                Ok(HwAddr::new(hw_addr_slice))
+            }
         }
     }
 
@@ -300,13 +308,18 @@ impl Message {
     /// Depending on set_mode, we may not have a payload.
     /// The actual amount and type of data retrieved by this function will
     /// depend on the mode set with the `set_mode()` function.
+    ///
+    /// WIREVEIL: fixed a *critical* flaw where the payload is always null, due to
+    ///           a difference with the C library
     pub fn get_payload(&self) -> &[u8] {
-        let c_ptr = std::ptr::null_mut();
-        let payload_len = unsafe { nfq_get_payload(self.nfad, &c_ptr) };
-        let payload: &[u8] =
-            unsafe { std::slice::from_raw_parts(c_ptr as *mut u8, payload_len as usize) };
+        let mut c_ptr = std::ptr::null_mut();
+        let payload_len = unsafe { nfq_get_payload(self.nfad, &mut c_ptr) };
 
-        payload
+        if c_ptr.is_null() || payload_len <= 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(c_ptr as *mut _, payload_len as usize) }
+        }
     }
 
     /// Print the queued packet in XML format into a buffer
